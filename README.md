@@ -31,13 +31,15 @@ remote-keyless-entry/
 
 ### Required Libraries (install via *Tools → Manage Libraries…*)
 
-| Library | Purpose |
-|---|---|
-| **RF24** by nRF24 | NRF24L01 radio driver |
-| **RTClib** by Adafruit | DS3231 RTC driver |
-| **ESP32Servo** by Kevin Harrington | Servo control on ESP32 |
+| Library | Device | Purpose |
+|---|---|---|
+| **RF24** by nRF24 | Master + Slave | NRF24L01 radio driver |
+| **RTClib** by Adafruit | Master + Slave | DS3231 RTC driver |
+| **ESP32Servo** by Kevin Harrington | Master only | Servo on ESP32 |
+| **Crypto** by Rhys Weatherley | Slave only | SHA256 for manual HMAC-SHA256 on Nano |
 
-> `Preferences.h` (NVS) and `mbedtls/md.h` (HMAC) are **built into** the ESP32 Arduino core — no extra install needed.
+> - `Preferences.h` (NVS) and `mbedtls/md.h` (HMAC) are built into the **ESP32** Arduino core — Master only.
+> - `EEPROM.h` and `Servo.h` are bundled with the **Arduino AVR** core — Slave only, no install needed.
 
 ---
 
@@ -83,14 +85,20 @@ Both devices are "paired" at flash time by sharing the same `shared_config.h`. T
 6. Open Serial Monitor (115200 baud) to see boot log and TX events.
 ```
 
-### Slave (Door Unit)
+### Slave (Door Unit — Arduino Nano)
 ```
 1. Open slave/slave.ino in Arduino IDE.
 2. Place shared_config.h in the same folder as slave.ino.
-3. Select the correct COM port for the Slave ESP32.
-4. Click Upload.
-5. Open Serial Monitor (115200 baud) on a second IDE window to see RX validation log.
+3. Select: Tools → Board → Arduino Nano
+4. Select: Tools → Processor → ATmega328P
+   (for older bootloader Nanos: select "ATmega328P (Old Bootloader)")
+5. Select the correct COM port for the Slave Nano.
+6. Click Upload.
+7. Open Serial Monitor (115200 baud) to see RX validation log.
 ```
+
+> [!TIP]
+> **First boot**: The Nano's EEPROM is blank. The firmware detects this via a magic word and initialises the counter to 0 automatically — no manual setup needed.
 
 > [!TIP]
 > You can use two separate Arduino IDE instances, each with its own Serial Monitor, to observe both sides simultaneously.
