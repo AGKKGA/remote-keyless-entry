@@ -72,8 +72,8 @@ static_assert(sizeof(RKEPacket) == RF_PAYLOAD_SIZE,
 #define DEBUG
 
 #ifdef DEBUG
-  #define DBG_PRINT(x)   Serial.print(x)
-  #define DBG_PRINTLN(x) Serial.println(x)
+  #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
+  #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
   // ESP32 has Serial.printf natively; AVR does not — use snprintf + print
   #ifdef ESP32
     #define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
