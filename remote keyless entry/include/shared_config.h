@@ -67,14 +67,29 @@ typedef struct __attribute__((packed)) {
 static_assert(sizeof(RKEPacket) == RF_PAYLOAD_SIZE,
               "RKEPacket size must equal RF_PAYLOAD_SIZE (32 bytes)");
 
+// ─── Slave Validation Result ──────────────────────────────────────
+// Defined here (in the header) so it is available before the Arduino
+// IDE inserts auto-generated function prototypes into slave.ino.
+// The enum is harmlessly ignored when compiling master.ino.
+typedef enum {
+    VALID = 0,
+    ERR_CHECKSUM,    // XOR checksum mismatch — corrupted frame
+    ERR_DEVICE_ID,   // Wrong device ID
+    ERR_COUNTER,     // Counter outside ±COUNTER_WINDOW
+    ERR_REPLAY,      // Counter already consumed (replay attack)
+    ERR_HMAC,        // HMAC-SHA256 mismatch
+    ERR_TIMESTAMP,   // Timestamp outside ±TIMESTAMP_TOLERANCE
+} ValidationResult;
+
 // ─── Debug Toggle ─────────────────────────────────────────────────
 // Comment out to disable Serial debug output in production builds.
 #define DEBUG
 
 #ifdef DEBUG
+  // Variadic macros forward all args so DBG_PRINT(val, HEX) works too.
   #define DBG_PRINT(...)   Serial.print(__VA_ARGS__)
   #define DBG_PRINTLN(...) Serial.println(__VA_ARGS__)
-  // ESP32 has Serial.printf natively; AVR does not — use snprintf + print
+  // ESP32 has Serial.printf natively; AVR (Nano) does not.
   #ifdef ESP32
     #define DBG_PRINTF(...) Serial.printf(__VA_ARGS__)
   #else
@@ -83,8 +98,8 @@ static_assert(sizeof(RKEPacket) == RF_PAYLOAD_SIZE,
            Serial.print(_dbg); } while(0)
   #endif
 #else
-  #define DBG_PRINT(x)
-  #define DBG_PRINTLN(x)
+  #define DBG_PRINT(...)
+  #define DBG_PRINTLN(...)
   #define DBG_PRINTF(...)
 #endif
 

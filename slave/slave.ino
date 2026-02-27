@@ -232,15 +232,8 @@ static void compute_hmac(uint32_t device_id, uint32_t counter,
 }
 
 // ─── Packet Validation ────────────────────────────────────────────
-typedef enum : uint8_t {
-    VALID = 0,
-    ERR_CHECKSUM,
-    ERR_DEVICE_ID,
-    ERR_COUNTER,
-    ERR_REPLAY,
-    ERR_HMAC,
-    ERR_TIMESTAMP,
-} ValidationResult;
+// ValidationResult enum is defined in shared_config.h so the Arduino
+// IDE can see it before it injects auto-generated function prototypes.
 
 static const __FlashStringHelper* val_result_str(ValidationResult r) {
     switch (r) {
