@@ -1,6 +1,6 @@
 # RKE System — Wiring Reference
 
-All connections use **ESP32 DevKit v1** (38-pin).
+**Master** uses **ESP32 DevKit v1** (38-pin). **Slave** uses **Arduino Nano** (ATmega328P).
 
 > [!WARNING]
 > **Pins to avoid:**
@@ -75,65 +75,75 @@ Use an **AMS1117-3.3** or **HT7333** LDO regulator between the TP4056 OUT+ and t
 
 ---
 
-## 4 · Slave — ESP32 → NRF24L01 (SPI)
-
-Identical to the Master wiring (Table 1). The Slave uses the same VSPI pins.
-
-| NRF24L01 Pin | ESP32 GPIO | Notes |
-|---|---|---|
-| VCC | 3.3 V | With bypass caps (10 µF + 100 nF) |
-| GND | GND | |
-| CE | GPIO 4 | |
-| CSN | GPIO 5 | |
-| SCK | GPIO 18 | |
-| MOSI | GPIO 23 | |
-| MISO | GPIO 19 | |
-| IRQ | — | Not connected |
-
----
-
-## 5 · Slave — ESP32 → DS3231 (I2C)
-
-Identical to the Master I2C wiring (Table 2).
-
-| DS3231 Pin | ESP32 GPIO | Notes |
-|---|---|---|
-| VCC | 3.3 V | |
-| GND | GND | |
-| SDA | GPIO 21 | |
-| SCL | GPIO 22 | |
-
----
-
-## 6 · Slave — ESP32 → Servo Motor (PWM)
+## 4 · Slave — Arduino Nano → NRF24L01 (SPI)
 
 > [!CAUTION]
-> **Do NOT power the servo from the ESP32 3.3 V rail.** A standard SG90 servo draws ~300 mA under load; a medium servo (MG996R) draws up to 1 A stall. This will either brown-out the ESP32 or destroy the 3.3 V LDO.
-> Use an **external 5 V supply** (phone charger, USB hub, 5 V buck converter from the wall adapter) with its GND tied to the ESP32 GND.
+> **Nano's onboard 3.3 V pin is limited to ~50 mA** from its AMS1117 regulator. The NRF24L01+PA external-antenna module can draw **up to 115 mA on TX** — this will brown-out the Nano.
+> **Use a separate AMS1117-3.3 breakout (or LD1117-3.3) powered from the Nano's 5 V pin** to supply the NRF24L01 independently. The basic non-PA NRF24L01 (12 mA max) is safe from the Nano's 3.3 V pin.
 
-| Servo Wire | Connection | Notes |
+Add a **10 µF electrolytic + 100 nF ceramic capacitor** across VCC/GND close to the module.
+
+| NRF24L01 Pin | Nano Pin | Wire colour (suggested) | Notes |
+|---|---|---|---|
+| VCC | External 3.3 V⁽¹⁾ | Red | **NOT** Nano's 3.3 V pin for PA module |
+| GND | GND | Black | Common ground |
+| CE | D9 | Orange | Chip Enable |
+| CSN | D10 | Yellow | SPI Chip Select (active LOW) |
+| SCK | D13 | Blue | Hardware SPI clock (also drives built-in LED) |
+| MOSI | D11 | Green | Hardware SPI Master-Out |
+| MISO | D12 | White | Hardware SPI Master-In |
+| IRQ | — | — | Not connected (polling used) |
+
+⁽¹⁾ External 3.3 V: wire an AMS1117-3.3 IN to Nano's 5 V pin, OUT to NRF24L01 VCC.
+
+---
+
+## 5 · Slave — Arduino Nano → DS3231 (I2C)
+
+Nano's I2C bus is **fixed** to A4 (SDA) and A5 (SCL) in hardware — `Wire.begin()` uses them automatically without passing pin arguments.
+
+The DS3231 module's onboard 4.7 kΩ pull-ups are sufficient. Power from 5 V for reliable operation.
+
+| DS3231 Pin | Nano Pin | Notes |
 |---|---|---|
-| Signal (Orange/Yellow) | GPIO 13 | PWM output from ESP32. GPIO 13 is safe at boot |
-| Power (Red) | External 5 V supply | NOT ESP32 3.3 V |
-| Ground (Brown/Black) | Common GND | Tied to ESP32 GND and 5 V supply GND |
+| VCC | 5 V | Module is 3.3 V–5.5 V tolerant; 5 V preferred on Nano |
+| GND | GND | Common ground |
+| SDA | A4 | Fixed hardware I2C SDA on Nano |
+| SCL | A5 | Fixed hardware I2C SCL on Nano |
+| SQW | — | Not connected |
+| 32K | — | Not connected |
+
+---
+
+## 6 · Slave — Arduino Nano → Servo Motor (PWM)
+
+> [!CAUTION]
+> **Do NOT power the servo from the Nano's 5 V pin when sourced from USB.** USB provides ~500 mA total; an SG90 servo draws ~300 mA under load and the Nano itself needs ~50 mA, leaving little margin. A medium servo (MG996R) can stall at 1 A+.
+> Use a **dedicated external 5 V supply** (USB charger, bench supply, or 5 V buck converter) with its GND tied to the Nano's GND.
+
+| Servo Wire | Nano Pin | Notes |
+|---|---|---|
+| Signal (Orange/Yellow) | D6 | PWM-capable at 490 Hz. Avoids SPI (D11–D13) and I2C (A4/A5) pins |
+| Power (Red) | External 5 V | NOT Nano's 5 V pin under USB power |
+| Ground (Brown/Black) | Common GND | Tied to Nano GND and external 5 V GND |
 
 **Servo PWM parameters** (set in `slave.ino`):
 - Pulse range: 500 µs (0°) → 2400 µs (180°)
 - Locked position: 0° (500 µs)
-- Unlocked position: 90° (1450 µs ≈ midpoint)
+- Unlocked position: 90° (~1450 µs)
 - Frequency: 50 Hz (standard hobby servo)
 
 ---
 
-## Quick-Reference GPIO Map
+## Quick-Reference Pin Map
 
-| GPIO | Master Role | Slave Role |
+| Signal | Master (ESP32) | Slave (Nano) |
 |---|---|---|
-| 4 | NRF24 CE | NRF24 CE |
-| 5 | NRF24 CSN | NRF24 CSN |
-| 13 | — | Servo PWM |
-| 18 | SPI SCK | SPI SCK |
-| 19 | SPI MISO | SPI MISO |
-| 21 | I2C SDA | I2C SDA |
-| 22 | I2C SCL | I2C SCL |
-| 23 | SPI MOSI | SPI MOSI |
+| NRF24 CE | GPIO 4 | D9 |
+| NRF24 CSN | GPIO 5 | D10 |
+| SPI SCK | GPIO 18 | D13 |
+| SPI MOSI | GPIO 23 | D11 |
+| SPI MISO | GPIO 19 | D12 |
+| I2C SDA | GPIO 21 | A4 (fixed) |
+| I2C SCL | GPIO 22 | A5 (fixed) |
+| Servo PWM | — | D6 |

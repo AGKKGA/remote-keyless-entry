@@ -1,28 +1,41 @@
 /**
  * slave.ino — Remote Keyless Entry System: SLAVE (Door Unit)
  * ═══════════════════════════════════════════════════════════════════
- * Hardware : ESP32 DevKit v1 + NRF24L01 (SPI) + DS3231 (I2C)
+ * Hardware : Arduino Nano (ATmega328P) + NRF24L01 (SPI) + DS3231 (I2C)
  *            + Servo Motor (PWM) + USB / wall-adapter power
  *
+ * ── Key differences vs. the ESP32 version ────────────────────────
+ * • EEPROM        instead of Preferences (NVS) for counter storage
+ * • Manual HMAC-SHA256 via Crypto library (Rhys Weatherley / SHA256.h)
+ *   instead of mbedTLS (ESP32 only)
+ * • Standard Servo.h instead of ESP32Servo
+ * • Wire.begin() with no args  — Nano I2C is fixed: SDA=A4, SCL=A5
+ * • No esp_sleep (Slave is mains-powered; no sleep needed)
+ * • F() macro used on string literals to keep them in Flash (PROGMEM)
+ *   and preserve the Nano's 2 KB SRAM
+ * • No Serial.printf — DBG_PRINTF in shared_config.h uses snprintf
+ *   on non-ESP32 targets
+ *
+ * ── RAM budget (ATmega328P, 2048 bytes) ──────────────────────────
+ * Globals: RF24(~32B) + RTC(~4B) + Servo(~8B) + SHA256 ctx(~104B)
+ *        + g_last_counter(4B) + replay_cache(164B) ≈ 316 B
+ * Stack headroom: >1700 B — adequate for all local buffers below.
+ *
  * Behaviour:
- *   • Boots, loads last-valid counter from NVS.
- *   • Continuously listens on NRF24L01 for RKE packets.
- *   • On receiving a packet, performs a 4-layer validation:
- *     1. XOR checksum  — fast discard of corrupted frames
- *     2. Device ID     — ensures packet is from our key fob
- *     3. Counter window — ±COUNTER_WINDOW of last known counter
- *     4. HMAC-SHA256   — cryptographic authenticity check
- *     5. Timestamp     — freshness check (< TIMESTAMP_TOLERANCE s)
- *   • On valid packet: rotates servo to unlock, waits 5 s, relocks.
- *   • Persists last valid counter to NVS to survive power cycles.
- *   • Anti-replay: every accepted counter is tracked; same code
- *     cannot unlock twice within the acceptance window.
+ *   • Boots, loads last-valid counter from EEPROM.
+ *   • Continuously polls NRF24L01 for incoming RKE packets.
+ *   • On packet: runs a 5-layer validation pipeline; on VALID rotates
+ *     servo to unlock, holds 5 s, relocks, saves counter to EEPROM.
+ *   • Anti-replay: consumed counters are blacklisted immediately.
  *
  * Libraries required (install via Arduino Library Manager):
- *   • RF24          — https://github.com/nRF24/RF24
- *   • RTClib        — https://github.com/adafruit/RTClib
- *   • ESP32Servo    — https://github.com/madhephaestus/ESP32Servo
- *   mbedTLS and Preferences are part of the ESP32 Arduino core.
+ *   • RF24        — search "RF24" by nRF24
+ *   • RTClib      — search "RTClib" by Adafruit
+ *   • Crypto      — search "Crypto" by Rhys Weatherley (arduinolibs)
+ *   Servo.h and EEPROM.h are bundled with the Arduino AVR core.
+ *
+ * Board: Arduino Nano — select "Arduino Nano" in Tools → Board.
+ *   For older bootloader Nanos: Tools → Processor → "ATmega328P (Old Bootloader)"
  *
  * Place shared_config.h in the same folder as this sketch.
  * ═══════════════════════════════════════════════════════════════════
@@ -35,75 +48,103 @@
 #include <RF24.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <Preferences.h>
-#include <ESP32Servo.h>
+#include <EEPROM.h>       // AVR non-volatile storage
+#include <Servo.h>        // Standard servo library (bundled with Arduino core)
 
-// mbedTLS HMAC-SHA256 (built into ESP32 Arduino core)
-#include "mbedtls/md.h"
+// Crypto library by Rhys Weatherley for SHA256
+// Install via Library Manager: search "Crypto" by Rhys Weatherley
+#include <SHA256.h>
 
-// ─── Pin Definitions (ESP32 DevKit v1) ────────────────────────────
-// SPI bus for NRF24L01 — same wiring as Master:
-//   MOSI = GPIO 23, MISO = GPIO 19, SCK = GPIO 18
-//   CSN  = GPIO 5,  CE   = GPIO 4
-#define PIN_NRF_CE   4
-#define PIN_NRF_CSN  5
+// ─── Pin Definitions (Arduino Nano / ATmega328P) ──────────────────
+// SPI bus for NRF24L01:
+//   MOSI = D11  (hardware SPI)
+//   MISO = D12  (hardware SPI)
+//   SCK  = D13  (hardware SPI — also drives the Nano's built-in LED)
+//   CSN  = D10  (hardware SS — also used as chip-select for NRF24)
+//   CE   = D9   (chip-enable — any digital output is fine)
+//
+// ⚠ Avoid using D11 / D12 / D13 for anything other than SPI.
+// ⚠ D13 = built-in LED — will flicker during SPI transfers (normal).
+// ⚠ Do NOT use D0 / D1 (UART RX/TX) as GPIO while Serial is active.
+#define PIN_NRF_CE    9
+#define PIN_NRF_CSN  10
 
-// I2C for DS3231
-#define PIN_SDA      21
-#define PIN_SCL      22
+// I2C for DS3231 — fixed hardware pins on Nano, no need to pass to Wire.begin()
+//   SDA = A4,  SCL = A5
 
 // Servo PWM output.
-// GPIO 13 is a safe, general-purpose output on ESP32 DevKit.
-// IMPORTANT: Power the servo from an external 5 V supply, NOT from the
-//   ESP32 3.3 V rail — servo stall current can exceed 500 mA and will
-//   brown-out the ESP32 or damage the 3.3 V regulator.
-// Connect servo GND to the same ground as ESP32.
-#define PIN_SERVO    13
+// D6 is a 490 Hz PWM-capable pin on Nano, safe from hardware SPI/I2C.
+// ⚠ Power the servo from an external 5 V rail — NOT the Nano's 5 V pin.
+//   USB-sourced 5 V can supply only ~400 mA total; a servo stall can
+//   exceed this and brown-out the Nano.  Tie servo GND to Nano GND.
+#define PIN_SERVO     6
+
+// ─── EEPROM Layout ────────────────────────────────────────────────
+// ATmega328P has 1024 bytes of EEPROM (rated ~100,000 write cycles).
+// The slave only writes on a valid unlock event, so wear is minimal.
+#define EEPROM_ADDR_MAGIC   0   // 4 bytes — detects first-boot blank EEPROM
+#define EEPROM_ADDR_CTR     4   // 4 bytes — last validated counter
+#define EEPROM_MAGIC_VAL    0xAB3C1D2EUL
 
 // ─── Global Objects ────────────────────────────────────────────────
 RF24        radio(PIN_NRF_CE, PIN_NRF_CSN);
 RTC_DS3231  rtc;
-Preferences prefs;
 Servo       doorServo;
 
+// SHA256 context kept in global BSS (not stack) to save stack space
+// during HMAC computation.  NOT reentrant, but single-threaded is fine.
+static SHA256 g_sha;
+
 // ─── State Variables ──────────────────────────────────────────────
-// Last counter value from a successfully validated packet.
 static uint32_t g_last_counter = 0;
 
-// Bitmap for anti-replay: track which counters within the acceptance
-// window have already been consumed.  The window is 2 * COUNTER_WINDOW
-// + 1 codes centred on g_last_counter.  We store consumed offsets
-// relative to the base counter when the window was last opened.
-//
-// For simplicity (and because COUNTER_WINDOW = 20) we keep a flat
-// array of at most 2*COUNTER_WINDOW+1 = 41 consumed counters.
+// Anti-replay cache: tracks consumed counter values within the acceptance
+// window so the same code cannot unlock twice.
+// Size = 2*COUNTER_WINDOW+1 = 41 entries × 4 bytes = 164 bytes in SRAM.
 #define REPLAY_CACHE_SIZE  (2 * COUNTER_WINDOW + 1)
 static uint32_t g_replay_cache[REPLAY_CACHE_SIZE];
 static uint8_t  g_replay_count = 0;
 
-// ─── NVS Helpers ──────────────────────────────────────────────────
-#define NVS_NAMESPACE "rke_slave"
-#define NVS_KEY_CTR   "last_ctr"
+// ─── EEPROM Helpers ───────────────────────────────────────────────
+/**
+ * eeprom_load_counter()
+ *
+ * Reads the last validated counter from EEPROM.
+ * Detects a blank/first-boot EEPROM via a magic word and initialises
+ * counter to 0 if needed.
+ * EEPROM.get() uses EEPROM.read() internally and is multi-byte safe.
+ */
+static void eeprom_load_counter(void) {
+    uint32_t magic = 0;
+    EEPROM.get(EEPROM_ADDR_MAGIC, magic);
 
-static void nvs_load_counter(void) {
-    prefs.begin(NVS_NAMESPACE, false);
-    g_last_counter = prefs.getUInt(NVS_KEY_CTR, 0);
-    prefs.end();
-    DBG_PRINTF("[NVS] Loaded last counter = %u\n", g_last_counter);
+    if (magic != EEPROM_MAGIC_VAL) {
+        // First boot — write magic and reset counter
+        DBG_PRINTLN(F("[EEPROM] First boot detected — initialising."));
+        EEPROM.put(EEPROM_ADDR_MAGIC, (uint32_t)EEPROM_MAGIC_VAL);
+        EEPROM.put(EEPROM_ADDR_CTR,   (uint32_t)0);
+        g_last_counter = 0;
+    } else {
+        EEPROM.get(EEPROM_ADDR_CTR, g_last_counter);
+        DBG_PRINTF("[EEPROM] Loaded last counter = %lu\n",
+                   (unsigned long)g_last_counter);
+    }
 }
 
-static void nvs_save_counter(void) {
-    prefs.begin(NVS_NAMESPACE, false);
-    prefs.putUInt(NVS_KEY_CTR, g_last_counter);
-    prefs.end();
-    DBG_PRINTF("[NVS] Saved last counter = %u\n", g_last_counter);
+/**
+ * eeprom_save_counter()
+ *
+ * Persists g_last_counter to EEPROM.
+ * EEPROM.put() compares each byte before writing (equivalent to
+ * EEPROM.update()), reducing unnecessary write cycles.
+ */
+static void eeprom_save_counter(void) {
+    EEPROM.put(EEPROM_ADDR_CTR, g_last_counter);
+    DBG_PRINTF("[EEPROM] Saved last counter = %lu\n",
+               (unsigned long)g_last_counter);
 }
 
 // ─── Anti-Replay Cache ────────────────────────────────────────────
-/**
- * replay_cache_contains() — O(n) scan; n ≤ 41, so this is fine.
- * Returns true if 'counter' has already been used.
- */
 static bool replay_cache_contains(uint32_t counter) {
     for (uint8_t i = 0; i < g_replay_count; i++) {
         if (g_replay_cache[i] == counter) return true;
@@ -111,156 +152,184 @@ static bool replay_cache_contains(uint32_t counter) {
     return false;
 }
 
-/**
- * replay_cache_add() — Add a counter to the consumed list.
- * If the cache is full (shouldn't happen with window ≤ 20),
- * the oldest entry is overwritten in a circular fashion.
- */
 static void replay_cache_add(uint32_t counter) {
     if (g_replay_count < REPLAY_CACHE_SIZE) {
         g_replay_cache[g_replay_count++] = counter;
     } else {
-        // Shift left and append — oldest entry evicted
+        // Circular eviction — drop oldest entry
         memmove(g_replay_cache, g_replay_cache + 1,
                 (REPLAY_CACHE_SIZE - 1) * sizeof(uint32_t));
         g_replay_cache[REPLAY_CACHE_SIZE - 1] = counter;
     }
 }
 
-/**
- * replay_cache_reset() — Called when Slave advances its base counter.
- * Old entries before the new base are no longer relevant.
- */
 static void replay_cache_reset(void) {
     g_replay_count = 0;
     memset(g_replay_cache, 0, sizeof(g_replay_cache));
 }
 
-// ─── HMAC-SHA256 Helper ───────────────────────────────────────────
+// ─── HMAC-SHA256 (Manual, using Crypto library) ───────────────────
 /**
- * compute_hmac() — identical to Master's implementation.
- * Must stay byte-for-byte identical with master.ino.
+ * compute_hmac()
+ *
+ * Computes HMAC-SHA256(SECRET_SEED, device_id || counter || timestamp)
+ * using the two-pass construction:
+ *   inner = SHA256( (K XOR ipad) || message )
+ *   hmac  = SHA256( (K XOR opad) || inner )
+ *
+ * The SECRET_SEED (32 bytes) is shorter than the SHA256 block size
+ * (64 bytes), so it is zero-padded to 64 bytes before XOR — done
+ * inline by clamping the loop.
+ *
+ * Only the first 16 bytes of the 32-byte digest are stored in the
+ * packet (sufficient for 128-bit authentication on this link).
+ *
+ * ⚠ g_sha is a file-scope static to avoid putting 104 bytes of SHA256
+ *   context on the stack inside this function.
+ *
+ * Stack usage of this function: message[12] + k_xor[64] + inner_hash[32]
+ *                               = 108 bytes  (well within Nano headroom)
+ *
+ * @param device_id   4-byte master identifier
+ * @param counter     rolling code counter value
+ * @param timestamp   Unix time from RTC
+ * @param out_hmac    output buffer, must be at least 16 bytes
  */
 static void compute_hmac(uint32_t device_id, uint32_t counter,
                           uint32_t timestamp, uint8_t *out_hmac) {
+
+    // Build the 12-byte message: device_id || counter || timestamp
     uint8_t message[12];
-    memcpy(message + 0, &device_id,  4);
-    memcpy(message + 4, &counter,    4);
-    memcpy(message + 8, &timestamp,  4);
+    memcpy(message + 0, &device_id, 4);
+    memcpy(message + 4, &counter,   4);
+    memcpy(message + 8, &timestamp, 4);
 
-    uint8_t full_hmac[32];
+    // 64-byte key pads (SHA256 block size).
+    // We reuse a single k_xor buffer for both ipad and opad passes.
+    uint8_t k_xor[64];
+    uint8_t inner_hash[32];
 
-    mbedtls_md_context_t ctx;
-    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    // ── Pass 1: inner hash = SHA256( K⊕ipad || message ) ─────────
+    // K⊕ipad: for i < 32 XOR SECRET_SEED[i] with 0x36; for i >= 32 use 0x36
+    for (uint8_t i = 0; i < 64; i++) {
+        k_xor[i] = (i < 32) ? (SECRET_SEED[i] ^ 0x36) : 0x36;
+    }
+    g_sha.reset();
+    g_sha.update(k_xor, 64);
+    g_sha.update(message, 12);
+    g_sha.finalize(inner_hash, 32);
 
-    mbedtls_md_init(&ctx);
-    mbedtls_md_setup(&ctx, info, 1);
-    mbedtls_md_hmac_starts(&ctx, SECRET_SEED, sizeof(SECRET_SEED));
-    mbedtls_md_hmac_update(&ctx, message, sizeof(message));
-    mbedtls_md_hmac_finish(&ctx, full_hmac);
-    mbedtls_md_free(&ctx);
-
-    memcpy(out_hmac, full_hmac, 16);
+    // ── Pass 2: outer hash = SHA256( K⊕opad || inner_hash ) ──────
+    // Reuse k_xor buffer for opad (0x5C instead of 0x36)
+    for (uint8_t i = 0; i < 64; i++) {
+        k_xor[i] = (i < 32) ? (SECRET_SEED[i] ^ 0x5C) : 0x5C;
+    }
+    g_sha.reset();
+    g_sha.update(k_xor, 64);
+    g_sha.update(inner_hash, 32);
+    // Write directly to out_hmac — SHA256::finalize() copies min(len, 32) bytes
+    g_sha.finalize(out_hmac, 16);
 }
 
 // ─── Packet Validation ────────────────────────────────────────────
-typedef enum {
+typedef enum : uint8_t {
     VALID = 0,
-    ERR_CHECKSUM,    // XOR checksum mismatch (corrupted frame)
-    ERR_DEVICE_ID,   // Wrong device ID
-    ERR_COUNTER,     // Counter outside acceptance window
-    ERR_REPLAY,      // Counter already consumed (replay attack)
-    ERR_HMAC,        // HMAC mismatch (tampered or wrong seed)
-    ERR_TIMESTAMP,   // Timestamp too old or too far in the future
+    ERR_CHECKSUM,
+    ERR_DEVICE_ID,
+    ERR_COUNTER,
+    ERR_REPLAY,
+    ERR_HMAC,
+    ERR_TIMESTAMP,
 } ValidationResult;
 
-static const char* val_result_str(ValidationResult r) {
+static const __FlashStringHelper* val_result_str(ValidationResult r) {
     switch (r) {
-        case VALID:          return "VALID";
-        case ERR_CHECKSUM:   return "CHECKSUM_FAIL";
-        case ERR_DEVICE_ID:  return "DEVICE_ID_MISMATCH";
-        case ERR_COUNTER:    return "COUNTER_OUT_OF_WINDOW";
-        case ERR_REPLAY:     return "REPLAY_DETECTED";
-        case ERR_HMAC:       return "HMAC_MISMATCH";
-        case ERR_TIMESTAMP:  return "TIMESTAMP_STALE";
-        default:             return "UNKNOWN";
+        case VALID:          return F("VALID");
+        case ERR_CHECKSUM:   return F("CHECKSUM_FAIL");
+        case ERR_DEVICE_ID:  return F("DEVICE_ID_MISMATCH");
+        case ERR_COUNTER:    return F("COUNTER_OUT_OF_WINDOW");
+        case ERR_REPLAY:     return F("REPLAY_DETECTED");
+        case ERR_HMAC:       return F("HMAC_MISMATCH");
+        case ERR_TIMESTAMP:  return F("TIMESTAMP_STALE");
+        default:             return F("UNKNOWN");
     }
 }
 
 /**
  * validate_packet()
  *
- * Runs the full 5-layer validation pipeline on a received packet.
- * Layers are ordered cheapest-to-most-expensive so expensive HMAC
- * only runs after cheaper checks pass.
- *
- * @param pkt         pointer to received packet
- * @param now_unix    current Unix time from local RTC
- * @return            ValidationResult — VALID or specific error code
+ * 5-layer validation pipeline — ordered cheapest to most expensive.
+ * Layers 1–3 are O(1) integer operations. Layer 4 is an O(n) scan
+ * (n ≤ 41). Layer 5 (HMAC) is the only cryptographic operation and
+ * only runs after all cheap checks pass.
  */
 static ValidationResult validate_packet(const RKEPacket *pkt,
                                         uint32_t now_unix) {
 
     // ── Layer 1: XOR Checksum ────────────────────────────────────
-    // Recompute checksum over first 28 bytes and compare with field.
     uint32_t expected_crc = 0;
     const uint8_t *raw = (const uint8_t *)pkt;
-    for (int i = 0; i < 28; i++) {
+    for (uint8_t i = 0; i < 28; i++) {
         expected_crc ^= ((uint32_t)raw[i]) << ((i % 4) * 8);
     }
     if (expected_crc != pkt->checksum) {
-        DBG_PRINTF("[VAL] Checksum fail: got 0x%08X, expected 0x%08X\n",
-                   pkt->checksum, expected_crc);
+        DBG_PRINT(F("[VAL] Checksum fail: got 0x"));
+        DBG_PRINT(pkt->checksum, HEX);
+        DBG_PRINT(F(" expected 0x"));
+        DBG_PRINTLN(expected_crc, HEX);
         return ERR_CHECKSUM;
     }
 
     // ── Layer 2: Device ID ────────────────────────────────────────
     if (pkt->device_id != DEVICE_ID) {
-        DBG_PRINTF("[VAL] Device ID mismatch: got 0x%08X, want 0x%08X\n",
-                   pkt->device_id, (uint32_t)DEVICE_ID);
+        DBG_PRINT(F("[VAL] Device ID mismatch: got 0x"));
+        DBG_PRINT(pkt->device_id, HEX);
+        DBG_PRINT(F(" want 0x"));
+        DBG_PRINTLN((uint32_t)DEVICE_ID, HEX);
         return ERR_DEVICE_ID;
     }
 
     // ── Layer 3: Counter Window ───────────────────────────────────
-    // Accept counters in [g_last_counter - WINDOW, g_last_counter + WINDOW].
-    // Cast to signed arithmetic to handle edge cases near 0.
+    // Use signed 32-bit arithmetic to handle window near counter = 0.
     int32_t delta = (int32_t)(pkt->counter) - (int32_t)(g_last_counter);
     if (delta < -(int32_t)COUNTER_WINDOW || delta > (int32_t)COUNTER_WINDOW) {
-        DBG_PRINTF("[VAL] Counter out of window: recv=%u last=%u delta=%d\n",
-                   pkt->counter, g_last_counter, delta);
+        DBG_PRINT(F("[VAL] Counter out of window: recv="));
+        DBG_PRINT(pkt->counter);
+        DBG_PRINT(F(" last="));
+        DBG_PRINT(g_last_counter);
+        DBG_PRINT(F(" delta="));
+        DBG_PRINTLN(delta);
         return ERR_COUNTER;
     }
 
-    // ── Layer 4: Anti-Replay ──────────────────────────────────────
+    // ── Layer 4: Anti-Replay Cache ────────────────────────────────
     if (replay_cache_contains(pkt->counter)) {
-        DBG_PRINTF("[VAL] Replay detected! Counter %u already used.\n",
-                   pkt->counter);
+        DBG_PRINT(F("[VAL] Replay detected! Counter "));
+        DBG_PRINT(pkt->counter);
+        DBG_PRINTLN(F(" already used."));
         return ERR_REPLAY;
     }
 
     // ── Layer 5: HMAC Verification ────────────────────────────────
-    // Recompute HMAC locally; compare with constant-time memcmp.
-    // Note: memcmp is NOT constant-time in general, but since we already
-    //   passed all cheaper checks, timing side-channels here are acceptable
-    //   for a portfolio/educational project.  Production code would use
-    //   mbedtls_ssl_safer_memcmp() or similar.
     uint8_t expected_hmac[16];
     compute_hmac(pkt->device_id, pkt->counter, pkt->timestamp, expected_hmac);
 
     if (memcmp(pkt->hmac, expected_hmac, 16) != 0) {
-        DBG_PRINTLN("[VAL] HMAC mismatch — packet rejected.");
+        DBG_PRINTLN(F("[VAL] HMAC mismatch — packet rejected."));
         return ERR_HMAC;
     }
 
-    // ── Layer 6 (Optional but important): Timestamp Freshness ────
-    // Reject packets older than TIMESTAMP_TOLERANCE seconds.
-    // Also reject packets timestamped more than TOLERANCE seconds in the
-    // future (prevents an attacker pre-computing future codes).
+    // ── Layer 6: Timestamp Freshness ─────────────────────────────
+    // Reject packets more than TIMESTAMP_TOLERANCE seconds old or future.
     int32_t ts_delta = (int32_t)now_unix - (int32_t)pkt->timestamp;
     if (ts_delta < -(int32_t)TIMESTAMP_TOLERANCE ||
         ts_delta >  (int32_t)TIMESTAMP_TOLERANCE) {
-        DBG_PRINTF("[VAL] Timestamp out of range: pkt_ts=%u now=%u delta=%d\n",
-                   pkt->timestamp, now_unix, ts_delta);
+        DBG_PRINT(F("[VAL] Timestamp stale: pkt_ts="));
+        DBG_PRINT(pkt->timestamp);
+        DBG_PRINT(F(" now="));
+        DBG_PRINT(now_unix);
+        DBG_PRINT(F(" delta="));
+        DBG_PRINTLN(ts_delta);
         return ERR_TIMESTAMP;
     }
 
@@ -269,49 +338,42 @@ static ValidationResult validate_packet(const RKEPacket *pkt,
 
 // ─── Servo Control ───────────────────────────────────────────────
 static void servo_unlock(void) {
-    DBG_PRINTLN("[SERVO] Unlocking door...");
+    DBG_PRINTLN(F("[SERVO] Unlocking door..."));
     doorServo.write(SERVO_UNLOCKED_DEG);
-    delay(UNLOCK_DURATION_MS);   // Hold unlocked for 5 seconds
+    delay(UNLOCK_DURATION_MS);
     doorServo.write(SERVO_LOCKED_DEG);
-    DBG_PRINTLN("[SERVO] Door re-locked.");
+    DBG_PRINTLN(F("[SERVO] Door re-locked."));
 }
 
 // ─── NRF24L01 Initialisation ─────────────────────────────────────
 static bool init_radio(void) {
     if (!radio.begin()) {
-        DBG_PRINTLN("[Radio] NRF24L01 init FAILED — check wiring!");
+        DBG_PRINTLN(F("[Radio] NRF24L01 init FAILED — check wiring!"));
         return false;
     }
-
     radio.setChannel(RF_CHANNEL);
     radio.setDataRate(RF_DATA_RATE);
     radio.setPALevel(RF_PA_LEVEL);
     radio.setPayloadSize(RF_PAYLOAD_SIZE);
-    radio.setAutoAck(false);           // No ACK sent back to Master
+    radio.setAutoAck(false);
     radio.openReadingPipe(1, PIPE_ADDRESS);
-    radio.startListening();            // RX mode
-
-    DBG_PRINTLN("[Radio] NRF24L01 ready (RX mode)");
-    DBG_PRINTF("[Radio] Channel=%d, DataRate=250kbps, Listening...\n",
-               RF_CHANNEL);
+    radio.startListening();  // RX mode
+    DBG_PRINTLN(F("[Radio] NRF24L01 ready (RX mode)"));
     return true;
 }
 
 // ─── DS3231 RTC Initialisation ────────────────────────────────────
 static bool init_rtc(void) {
-    Wire.begin(PIN_SDA, PIN_SCL);
+    // Wire.begin() with no arguments uses Nano's fixed I2C pins (A4=SDA, A5=SCL)
+    Wire.begin();
     if (!rtc.begin()) {
-        DBG_PRINTLN("[RTC] DS3231 not found — check I2C wiring!");
+        DBG_PRINTLN(F("[RTC] DS3231 not found — check I2C wiring!"));
         return false;
     }
     if (rtc.lostPower()) {
-        DBG_PRINTLN("[RTC] RTC lost power — seeding with compile time");
+        DBG_PRINTLN(F("[RTC] RTC lost power — seeding with compile time"));
         rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
     }
-    DateTime now = rtc.now();
-    DBG_PRINTF("[RTC] Current UTC: %04d-%02d-%02d %02d:%02d:%02d\n",
-               now.year(), now.month(), now.day(),
-               now.hour(), now.minute(), now.second());
     return true;
 }
 
@@ -319,81 +381,80 @@ static bool init_rtc(void) {
 void setup(void) {
 #ifdef DEBUG
     Serial.begin(115200);
-    delay(500);
-    Serial.println("\n╔══════════════════════════════╗");
-    Serial.println("║  RKE Slave — Door Unit Boot  ║");
-    Serial.println("╚══════════════════════════════╝");
+    delay(300);
+    Serial.println(F("\n+---------------------------------+"));
+    Serial.println(F("|  RKE Slave (Nano) — Door Boot  |"));
+    Serial.println(F("+---------------------------------+"));
 #endif
 
-    // Servo — attach and set to locked position on boot
-    doorServo.attach(PIN_SERVO, 500, 2400); // 500–2400 µs pulse range
+    // Servo — attach and set locked position immediately on boot
+    // Pulse range 500–2400 µs covers most hobby servos
+    doorServo.attach(PIN_SERVO, 500, 2400);
     doorServo.write(SERVO_LOCKED_DEG);
-    DBG_PRINTF("[Servo] Attached on GPIO %d, set to LOCKED (%d°)\n",
-               PIN_SERVO, SERVO_LOCKED_DEG);
+    DBG_PRINT(F("[Servo] Attached on D"));
+    DBG_PRINT(PIN_SERVO);
+    DBG_PRINTLN(F(" — LOCKED"));
 
     if (!init_rtc()) {
-        DBG_PRINTLN("[FATAL] RTC init failed. Halting.");
+        DBG_PRINTLN(F("[FATAL] RTC init failed. Halting."));
         while (true) delay(1000);
     }
 
-    nvs_load_counter();
+    eeprom_load_counter();
 
     if (!init_radio()) {
-        DBG_PRINTLN("[FATAL] Radio init failed. Halting.");
+        DBG_PRINTLN(F("[FATAL] Radio init failed. Halting."));
         while (true) delay(1000);
     }
 
-    DBG_PRINTLN("[Setup] Slave ready. Listening for RKE packets...\n");
+    DBG_PRINTLN(F("[Setup] Slave ready. Listening...\n"));
 }
 
 // ─── Arduino Loop ─────────────────────────────────────────────────
 void loop(void) {
-    // Poll radio — non-blocking check for available payload
     if (!radio.available()) {
-        return; // Nothing received — keep listening
+        return;  // Nothing in FIFO — keep polling
     }
 
-    // ── 1. Read the 32-byte packet from the radio FIFO ───────────
+    // ── 1. Read packet from radio FIFO ───────────────────────────
     RKEPacket pkt;
     radio.read(&pkt, sizeof(pkt));
 
-    DBG_PRINTLN("──────────────────────────────────");
-    DBG_PRINTF("[RX] Packet received | DeviceID=0x%08X Counter=%u TS=%u\n",
-               pkt.device_id, pkt.counter, pkt.timestamp);
+    DBG_PRINTLN(F("----------------------------------"));
+    DBG_PRINT(F("[RX] DevID=0x"));
+    DBG_PRINT(pkt.device_id, HEX);
+    DBG_PRINT(F("  Ctr="));
+    DBG_PRINT(pkt.counter);
+    DBG_PRINT(F("  TS="));
+    DBG_PRINTLN(pkt.timestamp);
 
     // ── 2. Get current time for timestamp freshness check ────────
-    DateTime    now      = rtc.now();
-    uint32_t    now_unix = now.unixtime();
+    DateTime now      = rtc.now();
+    uint32_t now_unix = now.unixtime();
 
-    // ── 3. Validate the packet ────────────────────────────────────
+    // ── 3. Validate ───────────────────────────────────────────────
     ValidationResult result = validate_packet(&pkt, now_unix);
 
     if (result != VALID) {
-        DBG_PRINTF("[RX] REJECTED — reason: %s\n", val_result_str(result));
+        DBG_PRINT(F("[RX] REJECTED — "));
+        DBG_PRINTLN(val_result_str(result));
         return;
     }
 
-    // ── 4. Packet is valid — perform unlock sequence ──────────────
-    DBG_PRINTLN("[RX] ✓ Packet VALID — Unlocking door!");
-
-    // Mark this counter as consumed (anti-replay)
+    // ── 4. Valid packet — mark counter as consumed ────────────────
+    DBG_PRINTLN(F("[RX] Packet VALID — Unlocking!"));
     replay_cache_add(pkt.counter);
 
-    // Advance Slave's counter to match Master.
-    // If the incoming counter is ahead (Master ahead of Slave), jump to it.
-    // If the incoming counter is behind-but-valid, still mark as consumed
-    // but don't roll back the base counter.
+    // Advance Slave's base counter if Master is ahead
     if (pkt.counter >= g_last_counter) {
-        // Counter has advanced — reset replay cache (old codes no longer
-        // within the acceptance window) and update base.
         replay_cache_reset();
-        replay_cache_add(pkt.counter);  // Re-add the new counter after reset
+        replay_cache_add(pkt.counter);   // Re-add after reset
         g_last_counter = pkt.counter;
-        nvs_save_counter();
+        eeprom_save_counter();
     }
 
-    // ── 5. Rotate servo to unlock, hold, re-lock ─────────────────
+    // ── 5. Unlock sequence ────────────────────────────────────────
     servo_unlock();
 
-    DBG_PRINTLN("[RX] Unlock cycle complete. Listening again...\n");
+    DBG_PRINTLN(F("[RX] Cycle complete. Listening again.\n"));
 }
